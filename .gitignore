@@ -1,0 +1,55 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor and IDE state
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+.cache/
+tmp/
+
+# CMake and build directories
+build/
+Build/
+out/
+dist/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+Testing/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Native build artifacts
+*.o
+*.obj
+*.a
+*.la
+*.lo
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Coverage and profiling
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Python helpers
+__pycache__/
+*.pyc
+.venv/
