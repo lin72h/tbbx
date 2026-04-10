@@ -401,6 +401,32 @@ and later by:
 
 This avoids baking `hwloc` heuristics into the broker permanently.
 
+### Immediate design rule
+
+The broker should not call `hwloc2` directly from grant policy code.
+
+Instead, `TBBX` should lock in a provider boundary now:
+
+- a topology/capacity provider interface above concrete data sources
+- `hwloc2` as the first provider implementation
+- FreeBSD `hmp(4)` as a later provider or score source
+
+The important consequence is architectural, not cosmetic:
+
+- the grant engine should consume abstract capacity/topology queries
+- not concrete `hwloc` calls embedded in broker policy paths
+
+That keeps phase 1 simple while preserving a clean future path to:
+
+- static topology from `hwloc2`
+- dynamic hybrid scores from native FreeBSD HMP/HFI
+
+The rule is:
+
+- abstract the provider now
+- keep `hwloc2` as the initial implementation
+- add HMP later without refactoring the broker core
+
 ### Phase 2
 
 When a usable FreeBSD-native interface exists, prefer:
@@ -446,6 +472,9 @@ Preferably through:
 
 That would let `TCM` consume native FreeBSD hybrid information without
 re-implementing kernel logic or scraping debug dumps.
+
+Until that exists, `TBBX` should treat HMP/HFI as an architectural target, not
+an immediate runtime dependency.
 
 ## Architecture Consequence For TCM
 

@@ -35,6 +35,11 @@ A shorter way to say it is:
 - oneTBB has the stronger coordination interface;
 - TCM is where they meet.
 
+One important refinement now that `PlanB` exists:
+
+- TCM is the immediate compatibility seam;
+- `permit_manager` is the preferred long-term native seam for TBBX.
+
 ## Core Position
 
 The platform should think in terms of **shared substrate plus runtime-specific
@@ -134,11 +139,11 @@ The non-candidates are:
 
 The clean way to do this is in stages.
 
-### Stage 0: Compatibility-first oneTBB support
+### Stage 0: Optional compatibility-first oneTBB support
 
 Goal:
 
-- support oneTBB with minimal disturbance.
+- support oneTBB with minimal disturbance when a compatibility lane is useful.
 
 Approach:
 
@@ -146,29 +151,28 @@ Approach:
 - let unmodified or minimally modified oneTBB use its existing TCM adaptor;
 - keep most oneTBB internals intact.
 
-This is the lowest-risk entry point.
+This is the lowest-risk entry point, but no longer the preferred destination.
 
-### Stage 1: Shared concurrency-governance substrate
+### Stage 1: Native permit-manager seam
 
 Goal:
 
-- stop duplicating concurrency-governance logic.
+- make `permit_manager` the native TBBX control boundary.
 
 Approach:
 
-- move permit arbitration and runtime coordination into a platform-native
-  broker;
-- let that broker consume the same pressure/admission philosophy already used
-  in the TWQ / `libdispatch` lane;
-- make oneTBB consume that broker through TCM-compatible semantics.
+- replace the TCM adaptor as the primary internal path with a native
+  `tbbx_permit_manager`;
+- preserve the TBB API and oneTBB scheduler identity above that seam;
+- keep platform topology, capacity, and pressure behind provider interfaces.
 
-At this stage, oneTBB still keeps its own scheduler, but it stops relying on an
-independent lower-level governance story.
+At this stage, oneTBB still keeps its own scheduler, but TBBX stops treating
+TCM compatibility as the permanent architecture.
 
 Critical invariant:
 
 - the shared substrate owns low-level mechanism;
-- the cross-runtime broker owns inter-runtime budgets;
+- the native permit manager owns runtime-visible budgets;
 - oneTBB continues to own intra-runtime allotment across its arenas.
 
 Those are different decisions and should not be collapsed into one layer.

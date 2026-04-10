@@ -2,10 +2,14 @@
 
 ## Purpose
 
-This document describes the immediate oneTBB integration path: provide a
+This document describes the immediate oneTBB compatibility path: provide a
 `libtcm.so.1`-compatible service layer now, and explain exactly how that layer
 can take advantage of the existing GCDX / TWQ / `pthread_workqueue` work
 without turning oneTBB into a dispatch runtime.
+
+This is now the `PlanA` document: useful as a bootstrap, comparison, and
+compatibility path, but no longer the preferred final TBBX architecture once a
+native `permit_manager` path is allowed.
 
 ## Immediate Goal
 
@@ -189,6 +193,19 @@ If the platform already has reliable knowledge about CPUs, capacity, or
 placement constraints from the main effort or shared topology code, the TCM
 broker should consume that instead of constructing its own competing view.
 
+That does not mean the broker should hard-wire itself to one concrete source.
+
+The better immediate design is:
+
+- keep broker policy independent of the concrete topology source;
+- put `hwloc2` behind a provider boundary in phase 1;
+- leave room for later native providers such as FreeBSD `hmp(4)` / HFI-backed
+  score export.
+
+This matters because `hwloc2` is the right phase-1 topology layer, but it
+should not become an unremovable dependency of the broker's policy logic if the
+platform later gains a better native hybrid-capacity source.
+
 ## Concrete TCM-to-TWQ Data Flow
 
 This is the immediate path that makes sense.
@@ -212,6 +229,9 @@ The broker starts with:
 - machine capacity;
 - process-local runtime state;
 - direct TCM client demand.
+
+Those inputs should come through an internal provider interface rather than
+directly from `hwloc2` calls inside the grant engine.
 
 ### Step 3: the broker incorporates dispatch/TWQ pressure
 
@@ -258,6 +278,14 @@ The cleanest immediate integration is:
 2. add a small private pressure-provider SPI below it;
 3. implement that SPI using the existing `libthr` / TWQ bridge or kernel
    snapshot path.
+
+There should also be an internal topology/capacity provider boundary alongside
+the future pressure provider boundary:
+
+1. phase 1 uses `hwloc2` behind that provider boundary;
+2. later phases may add native FreeBSD hybrid-capacity sources behind the same
+   interface;
+3. the broker core should not need to know which provider supplied the data.
 
 In other words:
 
