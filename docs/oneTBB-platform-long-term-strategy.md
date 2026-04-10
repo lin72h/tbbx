@@ -17,6 +17,24 @@ The target is:
 3. let oneTBB and `libdispatch` benefit from the same underlying effort rather
    than building two separate worker-admission and pressure systems.
 
+One important correction of emphasis:
+
+- oneTBB is not merely a source of "interface clues";
+- it is also a sophisticated upper-layer runtime with real scheduler policy,
+  arena semantics, and intra-runtime worker allotment logic.
+
+The asymmetry is therefore more precise when stated this way:
+
+- the platform has the stronger low-level concurrency substrate;
+- oneTBB has the stronger existing upper-layer scheduling model and a clean
+  coordination seam.
+
+A shorter way to say it is:
+
+- GCDX has the stronger execution mechanism;
+- oneTBB has the stronger coordination interface;
+- TCM is where they meet.
+
 ## Core Position
 
 The platform should think in terms of **shared substrate plus runtime-specific
@@ -54,6 +72,14 @@ This is the part that should be reused across runtimes:
 This substrate is where the existing TWQ / `libthr` / staged `libdispatch`
 effort is already strongest.
 
+One nuance from the TCM binary and `hwloc` research:
+
+- topology discovery should be treated as shared infrastructure, not as a
+  GCDX-private abstraction;
+- `hwloc` is the most plausible canonical cross-runtime topology layer for
+  TBBX, because Intel's own TCM uses it and FreeBSD already has a working
+  backend through `hwloc2`.
+
 ### oneTBB-specific upper layer
 
 This is the part that should remain oneTBB-shaped:
@@ -64,6 +90,10 @@ This is the part that should remain oneTBB-shaped:
 - work stealing and scheduler invariants;
 - task isolation, cancellation, and context semantics;
 - flow graph and algorithm-facing behavior.
+
+This upper layer includes real runtime intelligence, not just API surface.
+TBBX should treat it as a consumer of lower-level budgets and signals, not as
+an empty shell to be replaced.
 
 ### `libdispatch`-specific upper layer
 
@@ -135,6 +165,14 @@ Approach:
 At this stage, oneTBB still keeps its own scheduler, but it stops relying on an
 independent lower-level governance story.
 
+Critical invariant:
+
+- the shared substrate owns low-level mechanism;
+- the cross-runtime broker owns inter-runtime budgets;
+- oneTBB continues to own intra-runtime allotment across its arenas.
+
+Those are different decisions and should not be collapsed into one layer.
+
 ### Stage 2: Shared worker-provisioning support where semantics align
 
 Goal:
@@ -151,6 +189,15 @@ Approach:
 This does **not** mean "dispatch workers run TBB tasks" by default.
 It means the lower-level worker-management substrate becomes common where
 possible.
+
+Stopping rule:
+
+- replace mechanism;
+- do not replace oneTBB scheduler policy.
+
+If a proposed replacement starts to absorb market-style arena allotment,
+priority policy, or scheduler invariants, it has crossed the boundary and
+should stop.
 
 ### Stage 3: oneTBB-specific optimization on top of the shared substrate
 
@@ -233,6 +280,17 @@ Do not:
 - map oneTBB tasks directly onto dispatch queues as the primary design;
 - force arena semantics into queue-width semantics;
 - assume dispatch priorities and oneTBB scheduler policy are interchangeable.
+
+### oneTBB market-style policy should remain oneTBB-owned
+
+Do not:
+
+- move arena allotment policy into the shared substrate;
+- let the broker make per-arena scheduling decisions;
+- let dispatch QoS vocabulary become the internal policy language of oneTBB.
+
+The broker may cap oneTBB globally, but oneTBB should still decide how to
+spend that budget within its own runtime.
 
 ### The main TWQ lane should not depend on hidden TCM internals
 

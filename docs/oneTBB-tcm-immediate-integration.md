@@ -4,8 +4,8 @@
 
 This document describes the immediate oneTBB integration path: provide a
 `libtcm.so.1`-compatible service layer now, and explain exactly how that layer
-can take advantage of the existing TWQ / `pthread_workqueue` / `libdispatch`
-work without turning oneTBB into a dispatch runtime.
+can take advantage of the existing GCDX / TWQ / `pthread_workqueue` work
+without turning oneTBB into a dispatch runtime.
 
 ## Immediate Goal
 
@@ -36,6 +36,43 @@ So the immediate platform story should be:
 3. back that implementation with platform-native pressure and concurrency
    signals where possible.
 
+Phase-1 activation should be explicit, not ambient.
+
+Because oneTBB will try to load `libtcm.so.1` whenever it is present, the
+broker should be able to decline connection cleanly when coordination is not
+enabled for the process. The easiest phase-1 shape is an activation gate in
+`tcmConnect`, for example via an environment variable or equivalent platform
+switch.
+
+That activation decision is decisive:
+
+- if `tcmConnect` returns success, oneTBB commits to the TCM path;
+- if `tcmConnect` returns an error, oneTBB falls back to its internal `market`
+  path.
+
+There is no later fallback boundary inside the same process.
+
+## Export Surface And Compatibility Boundary
+
+The public oneTBB adaptor resolves 11 TCM symbols at load time, and all of them
+must be present for initialization to succeed.
+
+Intel's current shipped TCM binaries expose two additional compatibility
+exports:
+
+- `tcmRuntimeVersion`
+- `tcmRuntimeInterfaceVersion`
+
+So the practical phase-1 compatibility target is a 13-symbol surface:
+
+1. the 11 symbols oneTBB resolves directly;
+2. the 2 extra version-query exports shipped by Intel's current Linux and
+   Windows binaries.
+
+Those extra exports are functions, not data objects. oneTBB does not currently
+resolve them itself, but exporting them keeps the platform library closer to a
+drop-in replacement for Intel's shipped TCM runtime.
+
 ## Immediate Layering
 
 The clean phase-1 architecture is:
@@ -47,12 +84,42 @@ application
   -> oneTBB tcm_adaptor
   -> libtcm.so.1 (platform implementation)
   -> platform coordination broker
-  -> TWQ / pthread_workqueue / libthr pressure provider
-  -> kernel TWQ mechanism
 ```
 
 The crucial point is that oneTBB talks to `libtcm.so.1`, not to `libdispatch`
 queues, and not directly to `_pthread_workqueue_*`.
+
+Phase 1.5 then extends the lower half of the picture:
+
+```text
+libtcm.so.1 broker
+  -> private pressure provider in libthr / pthread_workqueue
+  -> kernel TWQ mechanism
+```
+
+## Permit-Centric Broker Model
+
+The broker must be modeled around permits, not around a single client-wide
+budget object.
+
+From the oneTBB adaptor behavior:
+
+1. `tcmConnect(...)` is called once per adaptor instance, producing one client
+   ID;
+2. each arena later issues its own `tcmRequestPermit(...)`;
+3. each permit carries its own demand and lifecycle;
+4. renegotiation is callback-driven per permit via the permit-specific
+   `callback_arg`.
+
+So the actual allocation problem in phase 1 is:
+
+- given one client with N permits, and potentially other clients with their own
+  permits later, distribute a total CPU budget across active permits.
+
+That means the broker should store:
+
+- a client table for ownership and disconnect lifecycle;
+- a permit table as the actual allocation unit.
 
 ## How TCM Can Benefit From The Existing TWQ / pthread_workqueue Work
 
@@ -135,6 +202,9 @@ Through the existing TCM adaptor, oneTBB tells the broker:
 - optional constraints;
 - thread participation updates.
 
+In oneTBB's current shape, that happens as one connected client with multiple
+permits, typically one permit per arena.
+
 ### Step 2: the broker computes a process-wide budget
 
 The broker starts with:
@@ -167,6 +237,9 @@ From there the broker computes:
 - allowed concurrency;
 - optional later placement constraints.
 
+In phase 1, those grants should be computed per permit, not as a single
+client-wide number.
+
 ### Step 5: oneTBB updates arena concurrency
 
 The existing oneTBB TCM adaptor already knows how to:
@@ -196,59 +269,120 @@ main agent's work.
 
 ## Suggested Private Provider Shape
 
-The most practical near-term shape is a **snapshot-style private SPI** exposed
-from the existing `libthr` / `pthread_workqueue` side rather than from
-`libdispatch` itself.
+The right near-term boundary is not polling-only and not event-only.
+
+It should be a **hybrid provider SPI** exposed from the existing `libthr` /
+`pthread_workqueue` side rather than from `libdispatch` itself:
+
+1. event notification so the broker does not have to poll blindly;
+2. versioned snapshot query so the broker can read a coherent state after an
+   event.
 
 For example:
 
 ```c
+typedef enum {
+    TWQ_PRESSURE_EVENT_CHANGED = 1,
+    TWQ_PRESSURE_EVENT_RISING,
+    TWQ_PRESSURE_EVENT_RELAXED
+} twq_pressure_event_t;
+
+typedef void (*twq_pressure_notify_f)(void* ctx, twq_pressure_event_t event,
+                                      uint64_t generation);
+
 struct twq_pressure_snapshot_v1 {
     uint32_t version;
     uint32_t ncpu;
+    uint64_t generation;
     uint64_t timestamp_ns;
 
+    uint32_t total_requested;
+    uint32_t total_admitted;
+    uint32_t total_active;
+    uint32_t total_recently_blocked;
+    uint32_t total_idle;
+
+    /* Explicitly defined as TWQ priority/QoS buckets, not vague "buckets". */
     uint32_t requested_by_bucket[6];
     uint32_t admitted_by_bucket[6];
     uint32_t active_by_bucket[6];
     uint32_t recently_blocked_by_bucket[6];
-    uint32_t idle_by_bucket[6];
 
     uint32_t narrow_hint_mask;
 };
 
-int _pthread_workqueue_pressure_snapshot_np(struct twq_pressure_snapshot_v1 *out);
+int _pthread_workqueue_register_pressure_listener_np(twq_pressure_notify_f fn,
+                                                     void* ctx);
+int _pthread_workqueue_get_pressure_snapshot_np(struct twq_pressure_snapshot_v1 *out);
 ```
 
-The exact field names can change, but the idea should stay the same:
+The exact shape can change, but the boundary principles should stay the same:
 
 - expose the data already closest to the runtime-to-kernel boundary;
 - keep the SPI private and platform-native;
-- let `libtcm.so.1` consume snapshots instead of peering into dispatch.
+- make the semantic meaning of each bucket explicit;
+- let `libtcm.so.1` react to change events, then pull a coherent snapshot.
 
-### Why snapshot-first is the best phase-1 shape
+### ABI hygiene for the provider SPI
 
-- it is simple to implement;
-- it is easy to test against existing counters and probes;
+The provider SPI should be versioned in semantics, not only in field names.
+
+That means:
+
+- the snapshot call should accept the consumer's structure size;
+- the provider must fill only the fields that fit in that size;
+- unknown fields must be zeroed, not left uninitialized;
+- the consumer must check `version` and any bucket-count field before reading
+  bucket arrays;
+- the callback registration path should tolerate a newer provider and an older
+  broker without undefined behavior.
+
+This matters because `libtcm.so.1` and the `libthr` provider may evolve on
+different schedules.
+
+### Why hybrid event + snapshot is the best phase-1.5 shape
+
+- pure polling introduces avoidable staleness;
+- pure events do not give the broker a coherent state to reason over;
+- a hybrid model matches the existing broker-to-runtime callback shape well;
 - it keeps dependencies one-way;
 - it does not require dispatch to become a first-class TCM client yet.
 
-### How `libtcm.so.1` should use the snapshot
+### How `libtcm.so.1` should use the provider
 
 At minimum, the broker can:
 
-1. estimate how much concurrency is already effectively occupied by the
-   dispatch/TWQ lane;
-2. treat admitted and active workers as stronger consumption signals than raw
-   requests;
-3. treat recently blocked workers as partially consuming capacity, in the same
+1. treat total admitted and active workers as stronger consumption signals than
+   raw requests;
+2. treat recently blocked workers as partially consuming capacity, in the same
    spirit as the main lane's admission model;
-4. reduce oneTBB permit grants when dispatch pressure is high;
-5. relax those grants again when TWQ pressure falls.
+3. use TWQ priority/QoS bucket information as a policy input where it matters,
+   without depending on dispatch internals;
+4. reduce oneTBB permit grants when TWQ pressure is rising or sustained;
+5. relax those grants again when pressure falls.
 
 That gives the TCM broker a direct way to benefit from the main agent's kernel
 and `pthread_workqueue` work without turning dispatch into a dependency surface
 for oneTBB.
+
+## Callback Reentrancy Protocol
+
+The broker must specify the renegotiation protocol explicitly before
+implementation.
+
+Required rules:
+
+1. the broker must not hold its main mutable state lock while invoking the
+   TCM callback;
+2. the broker must first commit the new grant state into broker-owned storage;
+3. the callback should be delivered asynchronously or via deferred notification
+   after state commit;
+4. it must be legal for callback-driven oneTBB code to re-enter the broker via
+   `tcmGetPermitData(...)` and later `tcmRequestPermit(...)`;
+5. callback delivery must be per changed permit, not merely per client.
+
+This is the most dangerous correctness boundary in the phase-1 design. It must
+be treated as a protocol, not as an implementation detail.
 
 ## Immediate Implementation Phases
 
@@ -256,12 +390,37 @@ for oneTBB.
 
 Implement:
 
-- full exported TCM symbol set;
+- 13 exported symbols matching the current Intel 1.2.0 surface;
 - process-local client and permit tracking;
-- simple fair-share concurrency grants;
+- permit-centric fair-share concurrency grants;
 - explicit `INACTIVE` handling;
 - thread registration accounting;
-- callback-driven grant refresh.
+- `hwloc` as the canonical topology layer, but only for PU counting and
+  constraint capture in phase 1;
+- activation gate in `tcmConnect`;
+- callback-driven grant refresh;
+- no dependency on TWQ pressure yet.
+
+The grant model should stay deliberately simple in phase 1:
+
+- treat `INACTIVE` versus "not inactive" as the only semantically important
+  state distinction for oneTBB;
+- satisfy per-permit mandatory floors first;
+- divide remaining capacity across active permits;
+- do not attempt to model richer TCM policy features yet.
+
+When mandatory floors exceed available budget, phase 1 should use an explicit
+conflict rule rather than silently overcommitting:
+
+1. preserve at least a minimal non-zero floor for each active permit when
+   possible;
+2. reduce mandatory floors proportionally when total requested floors exceed
+   available budget;
+3. never exceed the computed total CPU budget in order to "honor" every floor
+   simultaneously.
+
+The exact proportional rule can stay simple in phase 1, but it must be written
+down and tested.
 
 At this stage, the broker can work even before TWQ pressure is wired in.
 
@@ -270,7 +429,8 @@ At this stage, the broker can work even before TWQ pressure is wired in.
 Add:
 
 - a pressure-provider interface below the broker;
-- dispatch/TWQ pressure snapshots as an input to grant decisions;
+- event notification plus coherent TWQ pressure snapshot as input to grant
+  decisions;
 - reuse of existing admission and narrowing ideas from the main lane.
 
 This is the first point where oneTBB meaningfully benefits from the other main
@@ -304,6 +464,46 @@ lane already has a better one.
 It can start simpler for phase 1, but it should converge toward the same
 platform-native pressure philosophy rather than drifting into a second
 unrelated policy engine.
+
+### Do not confuse inter-runtime and intra-runtime arbitration
+
+The broker should not:
+
+- decide how oneTBB divides its granted budget across arenas;
+- replace oneTBB market-style allotment logic;
+- make per-task or per-arena scheduling decisions.
+
+Its authority is the runtime-level budget ceiling, not oneTBB's internal
+scheduler policy.
+
+### Do not over-model TCM semantics in phase 1
+
+Phase 1 should not assume more semantic richness than oneTBB currently uses.
+
+Specifically:
+
+- do not build elaborate `PENDING` / `IDLE` transitions unless workload
+  evidence requires them;
+- do not depend on immediate permit fill through the final `tcmRequestPermit`
+  parameter, because oneTBB currently passes `nullptr` and reads grants later
+  via `tcmGetPermitData(...)`;
+- do not treat `stale`, `exclusive`, or `rigid_concurrency` as mandatory for
+  correctness in the first broker.
+
+## Validation And CI Requirements
+
+The market fallback path must stay healthy even after `libtcm.so.1` exists.
+
+At minimum, CI should exercise two configurations:
+
+1. `libtcm.so.1` present and TCM explicitly enabled:
+   - proves oneTBB is using the broker path
+2. `libtcm.so.1` present and TCM explicitly disabled:
+   - proves oneTBB still falls back cleanly to `market`
+
+If the second configuration fails, it should be treated as a blocker. The
+fallback path is not optional engineering debt; it is the escape hatch while
+the broker matures.
 
 ### Do not move TCM into the kernel
 

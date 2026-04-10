@@ -52,15 +52,18 @@ the TBB/TCM sidecar work and the main `libdispatch` work:
 
 The asymmetry is real, and it should be stated precisely:
 
-- this platform already has more usable execution mechanism;
-- oneTBB currently exposes more usable coordination-interface clues.
+- this platform already has the stronger low-level execution mechanism;
+- oneTBB already has a sophisticated upper-layer scheduler plus a usable
+  coordination seam.
 
 That means the most productive reuse direction is:
 
 1. reuse the platform's TWQ / `libdispatch`-era mechanism and policy work
    underneath;
-2. reuse oneTBB/TCM mainly as a contract, state vocabulary, and compatibility
-   target above;
+2. reuse oneTBB/TCM as both:
+   - a contract and compatibility target, and
+   - a proven upper-layer scheduling model whose internal runtime semantics
+     should be respected;
 3. let oneTBB benefit from the platform implementation, not the other way
    around.
 
@@ -120,6 +123,13 @@ The right relationship is:
 - let that broker be informed by the same platform-native machinery family as
   the dispatch lane.
 
+Explicit authority boundary:
+
+- the broker owns inter-runtime budgets;
+- oneTBB owns intra-runtime allotment across its own arenas.
+
+Those are different arbitration levels and should remain separate.
+
 ### 4. Validation asymmetry
 
 The main lane is already the stronger validation vehicle for core mechanism:
@@ -174,6 +184,72 @@ These are the highest-value local files and functions behind the analysis:
   - TCM as a runtime coordination layer for CPU resource sharing
 - `doc/main/tbb_userguide/appendix_B.rst`
   - user-facing description of TCM as an oversubscription-avoidance layer
+- unpacked Intel TCM package trees in `../nx`
+  - exported symbol shape, bundled dependencies, and platform packaging
+- unpacked `hwloc-2.13.0` source plus FreeBSD `devel/hwloc2` port metadata
+  - topology, affinity, NUMA, and `cpukinds` support quality on FreeBSD
+
+## Binary And Platform Findings
+
+The local binary and packaging pass materially strengthens the architecture.
+
+### 1. Intel TCM is a cross-platform user-space runtime
+
+The unpacked Intel TCM package trees confirm current binaries for:
+
+- Linux x86_64
+- Windows x86_64
+
+Older 1.1.x packages also exist in Intel's package feed for 32-bit Linux and
+Windows, but the current 1.2.0 packages we verified are 64-bit.
+
+### 2. Intel TCM uses `hwloc` as its actual topology layer
+
+The current Linux package bundles `libhwloc.so.15`, and the current Windows
+package bundles `libhwloc-15.dll`.
+
+The Linux and Windows binaries both reference:
+
+- `hwloc_topology_*`
+- `hwloc_bitmap_*`
+- `hwloc_get_cpubind`
+- `hwloc_cpukinds_get_nr`
+- `hwloc_cpukinds_get_info`
+
+That makes `hwloc` part of the real TCM design, not a hypothetical helper.
+
+### 3. Intel TCM does not appear to rely on a Linux-only kernel control API
+
+The Linux binary links against:
+
+- `libhwloc.so.15`
+- standard libc / libstdc++ / `libdl` / `libm` / `libgcc`
+
+Its imported/runtime-visible behavior includes:
+
+- pthread locking / TLS
+- `sched_yield`
+- `hwloc` topology traversal
+
+It does not visibly depend on a Linux-specific runtime-control API comparable to
+`pthread_workqueue`.
+
+### 4. FreeBSD `hwloc2` already covers the important phase-1 topology needs
+
+The local `hwloc-2.13.0` source tree and FreeBSD `devel/hwloc2` port confirm:
+
+- CPU affinity support through `cpuset_setaffinity` / `cpuset_getaffinity`
+- NUMA discovery through `vm.phys_locality`, `vm.phys_segs`, and `vm.ndomains`
+- memory-domain binding through `cpuset_setdomain` / `cpuset_getdomain`
+- last-CPU-location queries through `sysctl` and thread identity
+
+The main caveat is `cpukinds` quality:
+
+- the API exists on FreeBSD;
+- on x86 it relies largely on CPUID-backed heuristics rather than strong
+  OS-native efficiency reporting;
+- so heterogeneous-core policy should stay conservative until proven on target
+  hardware.
 
 ## Strong Source-Level Findings
 
@@ -218,6 +294,15 @@ The dynamic-link table in `tcm_adaptor.cpp` asks for:
 `dynamic_link.cpp` resolves every requested symbol before it marks the library
 as initialized. So a minimum viable compatibility library must export the full
 surface, even if some functions are temporary stubs.
+
+Binary inspection tightens that requirement slightly:
+
+- Intel's current Linux and Windows TCM packages export two additional version
+  functions, `tcmRuntimeVersion` and `tcmRuntimeInterfaceVersion`.
+
+oneTBB does not currently resolve them through `tcm_adaptor.cpp`, but a
+drop-in platform replacement should still export all 13 symbols shipped by the
+current Intel runtime.
 
 ### 4. The hot path oneTBB actually depends on is narrower than the API
 
@@ -304,6 +389,12 @@ TCM is best modeled as:
    placement information;
 5. with asynchronous renegotiation when the broker changes a grant.
 
+For oneTBB specifically, the practical first model is:
+
+- one connected client per `tcm_adaptor`;
+- multiple permits under that client, typically one per arena;
+- permit-level allocation and renegotiation.
+
 ### `tcmConnect`
 
 Meaning:
@@ -318,6 +409,12 @@ Minimum oneTBB-facing semantics:
 - callback remains valid until disconnect;
 - oneTBB can assume the returned client ID is stable for the life of the
   adaptor.
+
+Important phase-1 consequence:
+
+- `tcmConnect` is also the activation gate;
+- if it succeeds, oneTBB commits to the TCM path;
+- if it fails, oneTBB falls back to `market`.
 
 ### `tcmDisconnect`
 
@@ -343,6 +440,13 @@ Minimum oneTBB-facing semantics:
   time;
 - `request_as_inactive` must be honored at least enough to keep initial arena
   concurrency at zero.
+
+Practical oneTBB nuance:
+
+- the last `tcmRequestPermit(...)` parameter allows immediate permit fill;
+- oneTBB currently passes `nullptr` there and fetches grant state later via
+  `tcmGetPermitData(...)`;
+- phase 1 can therefore treat immediate fill as optional.
 
 ### `tcmGetPermitData`
 
@@ -440,6 +544,12 @@ updates cleanly.
    - `request_as_inactive = 1`
 5. optional CPU constraints are attached only if arena constraints require them
    and an affinity mask is available.
+
+This means the first broker should think in terms of:
+
+- one client connection;
+- multiple arena-backed permits beneath it;
+- per-permit budgets, not only per-client budgets.
 
 ### Demand growth
 
@@ -635,6 +745,7 @@ The kernel should keep doing TWQ things. The broker should sit above that.
 - no daemon
 - no kernel ABI changes required
 - enough semantics for oneTBB first
+- `hwloc` as the canonical topology layer
 
 ### Internal objects
 
@@ -642,12 +753,14 @@ The kernel should keep doing TWQ things. The broker should sit above that.
 - permit table keyed by `tcm_permit_handle_t`
 - thread-local current permit binding for `UnregisterThread`
 - generation counter or dirty flag for callback scheduling
+- shared `hwloc` topology handle for PU counting and later constraint handling
 
 ### Phase-1 arbitration model
 
 Use a simple fair-share governor:
 
-1. compute a process-wide CPU budget from available CPUs;
+1. compute a process-wide CPU budget from available PUs discovered through
+   `hwloc`;
 2. optionally subtract externally known TWQ/libdispatch pressure later;
 3. satisfy active permits' mandatory floor first (`min_sw_threads`);
 4. distribute the remainder across requested headroom (`max - min`);
@@ -678,6 +791,7 @@ start.
 Treat placement constraints conservatively:
 
 - accept and store them;
+- use `hwloc` as the canonical parser and storage model;
 - enforce only what is already easy and correct;
 - allow pure concurrency-only behavior when masks are unavailable.
 
