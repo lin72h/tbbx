@@ -259,15 +259,19 @@ It is therefore upstream-aligned, not fully platform-owned.
 
 ## Preconditions
 
-PlanC only becomes executable when the actual TCM source lands.
+PlanC becomes executable when actual TCM source is available.
 
-As of April 10, 2026:
+As of 2026-04-27:
 
 - the RFC is merged
-- the `thread_composability_manager/` source tree is not yet present in the
-  local oneTBB clone
+- official open TCM source exists in oneTBB PR #2061
+- the PR is open, not merged
+- the source is cloned locally in `../nx/oneTBB-TCM`
+- source review confirms a real standalone TCM implementation, not only a
+  placeholder
 
-So today PlanC is a strategy, not yet an implementation task.
+So PlanC is no longer only a strategy. It is now a source-based port and
+integration task, with merge status still upstream-controlled.
 
 ## FreeBSD Porting Assumptions
 
@@ -289,24 +293,31 @@ That should affect quality, not basic viability.
 
 ## Biggest Risks
 
-### Risk 1: upstream TCM may not expose a clean provider seam
+### Risk 1: upstream TCM does not obviously expose a clean provider seam
 
-The RFC confirms independence and `hwloc` dependence, but it does not confirm a
-pluggable provider architecture. If the real source bakes `hwloc` calls and
-grant-policy assumptions directly into the arbitration engine, then the FreeBSD
-pressure bridge will require local patching rather than clean injection.
+Source review confirms independence and `hwloc` dependence, but the current
+implementation directly wraps `hwloc` in `system_topology` and uses that path
+from the grant engine. A clean topology/capacity/pressure provider seam is not
+obvious yet.
+
+If the upstream implementation keeps `hwloc` and resource-accounting details
+embedded directly in the arbitration engine, then the FreeBSD pressure bridge
+will require local patching or an upstream provider refactor rather than clean
+injection.
 
 This is the most important structural risk in PlanC.
 
-### Risk 2: upstream timeline is still outside project control
+### Risk 2: upstream merge timeline is still outside project control
 
-The RFC is merged, but the actual source tree is not in the local clone yet.
-PlanC is therefore a bet on upstream timing as well as upstream architecture.
+The source exists in PR form, but it is not merged. PlanC is therefore no
+longer blocked on source visibility, but it is still exposed to upstream review
+and merge timing.
 
 Recommended checkpoint:
 
 - reassess upstream landing status in October 2026
-- if real source is still absent by then, revisit PlanB formally
+- if PR #2061 or an equivalent TCM source drop has still not merged by then,
+  revisit PlanB formally
 
 ### Risk 3: `hwloc` `cpukinds` quality on FreeBSD is only a partial answer
 
@@ -361,14 +372,21 @@ The provider SPI should be:
 - snapshot-first in v1
 - optionally event-assisted later if polling proves too stale
 
-It should expose enough for TCM to make smarter budget decisions, for example:
+It should expose enough for TCM to make smarter budget decisions, but only as
+mechanism facts. The provider should expose current gauges and cumulative
+event counters, not policy interpretations.
 
-- total active workers
-- total admitted workers
-- total blocked workers
-- aggregate pressure state
-- aggregate consumed capacity
-- generation counter and timestamp
+It should expose:
+
+- generation counter and monotonic timestamp
+- current total workers
+- current idle workers
+- current non-idle workers
+- cumulative requested worker counter
+- cumulative admitted worker counter
+- cumulative blocked worker counter
+- cumulative unblocked worker counter
+- cumulative narrowing event counter
 
 It should not expose:
 
@@ -376,31 +394,71 @@ It should not expose:
 - raw kernel scheduler internals
 - direct worker control hooks for TCM
 - per-QoS bucket detail
+- total CPU count
+- pressure-state enums such as relaxed/moderate/tight
+- consumed-capacity fractions
+- TCM permit or grant vocabulary
 
 Per-QoS detail should stay below the provider SPI. The provider should
-translate it
-into aggregate pressure and capacity signals rather than leaking GCDX-internal
+translate it into aggregate pressure facts rather than leaking GCDX-internal
 vocabulary upward into TCM.
 
 Recommended shape:
 
 ```c
-struct tbbx_pressure_snapshot_v1 {
-    uint32_t struct_size;
+struct _pthread_workqueue_pressure_snapshot_v1 {
+    size_t struct_size;
     uint32_t version;
+    uint32_t _pad0;
     uint64_t generation;
     uint64_t timestamp_ns;
 
-    uint32_t ncpu;
-    uint32_t total_consumed;
-    uint32_t total_requested;
-    uint32_t pressure_state;
-    uint32_t reserved[8];
+    /* Current gauges at capture time. */
+    uint32_t total_workers;
+    uint32_t idle_workers;
+    uint32_t nonidle_workers;
+
+    /* Cumulative event counters since the provider's base snapshot. */
+    uint32_t requested_workers;
+    uint32_t admitted_workers;
+    uint32_t blocked_workers;
+    uint32_t unblocked_workers;
+    uint32_t narrowed_events;
+
+    uint32_t reserved[6];
 };
 ```
 
-Version by `struct_size` first. The caller passes the size it understands. The
-provider fills only what fits. That is the safest initial ABI hygiene model.
+Version by `struct_size` first. `version` is informational. The caller passes
+the size it understands, and the provider fills only what fits. Consumers
+should branch on field presence by `struct_size`, not by `version`. A field is
+present only if `struct_size` covers the whole field. `generation == 0` means
+no pressure data is available yet.
+
+The cumulative `uint32_t` event counters may wrap. Consumers must compute
+deltas with wrapping-safe unsigned subtraction. The live v1 layout is intended
+for the LP64 FreeBSD runtime shape; an ILP32 consumer would need a separate ABI
+review because `size_t` width is part of the layout.
+
+This struct belongs to the platform pressure-provider layer, not to TBBX. The
+definition should live in a libthr / pthread-workqueue-owned private header.
+TBBX code may include that platform header, but libthr must not include a TBBX
+header to implement the interface.
+
+The native provider should use the same `size_t struct_size` convention as the
+current GCDX `twq_pressure_provider_*` structs. A TBBX-only projection type may
+use different widths internally, but it must not become the provider wire
+format.
+
+TBBX derives backlog facts above the provider line:
+
+```text
+request_backlog = max(requested_workers - admitted_workers, 0)
+block_backlog   = max(blocked_workers - unblocked_workers, 0)
+```
+
+Backlog is useful for saturation detection and later hysteresis, but reserve
+permit size remains based on current non-idle workers.
 
 The point is to inform TCM, not to make TCM a scheduler.
 
@@ -410,16 +468,16 @@ The point is to inform TCM, not to make TCM a scheduler.
 
 Goals:
 
-- watch for actual TCM source landing
-- inspect the upstream source tree and build system immediately when it lands
-- verify whether the real source matches the RFC-level expectations
+- track PR #2061 until merge
+- inspect source updates and review comments
+- verify whether the real source remains close to the current local clone
 
 ### Phase C0.5: Freeze The Provider Boundary In Parallel
 
 Goals:
 
-- design the topology, capacity, and pressure provider interfaces before
-  upstream TCM source lands
+- design the topology, capacity, and pressure provider interfaces while PR
+  review and FreeBSD port work proceed
 - validate those interfaces against existing GCDX machinery
 - keep the provider boundary usable by both PlanC and PlanB
 
@@ -445,14 +503,30 @@ Goals:
 - validate fallback to `market`
 - document real FreeBSD limitations
 - measure whether TCM alone already gives acceptable coordination
+- run the mixed GCD + oneTBB baseline with TCM off versus TCM on but no
+  pressure adapter
 
 ### Phase C3: Add The GCDX Pressure Bridge
 
 Goals:
 
 - expose private pressure facts upward from TWQ / `pthread_workqueue`
-- let TCM consume them through a provider boundary
+- let a FreeBSD TCM pressure adapter consume them through a provider boundary
+- create a private reserve client and reserve permit through the public TCM API
+- package the adapter as a sidecar such as `libtbbx_twq_bridge.so`, not as a
+  TCM source patch in v1
+- use a separate TCM client with a non-null no-op callback
+- set `rigid_concurrency = 1` on reserve-permit requests
+- deactivate the reserve permit with `tcmDeactivatePermit` when demand drops
+  to zero
+- release the reserve permit explicitly before disconnecting the reserve
+  client at sidecar shutdown
+- use explicit harness polling for the prototype trigger and defer production
+  trigger selection until the bridge shows measured value
 - measure whether kernel-informed pressure materially improves grant quality
+
+The adapter-created reserve permit is the default v1 design. It avoids TCM
+grant-engine changes while still using normal TCM negotiation and callbacks.
 
 This is the distinctive PlanC step.
 

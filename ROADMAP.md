@@ -25,16 +25,57 @@ What is done:
   - `PlanB` = native `permit_manager` contingency path
   - `PlanC` = upstream/open TCM riding on top of native GCDX / TWQ / future
     `hmp` machinery
+- source-based review of official open TCM PR #2061:
+  - real `thread_composability_manager/` source is present in the PR branch
+  - TCM is a standalone `libtcm.so.1` project with `hwloc` dependency
+  - the core grant engine is visible and no longer has to be guessed
+  - no clean provider seam is obvious yet
+  - GCDX pressure is best represented in TCM's permit economy as a private
+    adapter-created reserve permit fed by a one-way pressure snapshot and the
+    public TCM API
+  - v1 reserve integration should be a sidecar adapter, not a TCM source patch
+  - zero reserve demand should use `tcmDeactivatePermit`
+  - the reserve client needs a non-null no-op callback and
+    `rigid_concurrency = 1`
+  - `TCM_ENABLE` lifecycle must be handled as an optional feature, not a hard
+    dependency
+- GCDX M15 pressure-provider coordination review:
+  - lower provider surface remains `twq_pressure_provider_*`
+  - GCDX/TWQ/libthr stay TCM-blind
+  - TBBX consumes the bundle artifact above the provider line
+  - v1 reserve-demand projection uses `nonidle_workers_current`
+  - future live pressure SPI uses platform-neutral
+    `_pthread_workqueue_pressure_snapshot_v1`
+  - native provider structs keep GCDX's `size_t struct_size` convention
+  - request/block backlog are adapter-derived signals, not reserve size
 - concrete native design note for `tbbx_permit_manager`
 - comprehensive PlanC design note
+- open TCM / GCDX integration plan
+- GCDX M15 pressure-provider consumption note
+- ISPC / ISPCRT consumer-seam analysis:
+  - `ISPCRT` CPU runtime is the real `TBB` consumer
+  - current active `TBB` path is narrow and based on `parallel_for`
+  - `ispcrtSetTaskingCallbacks()` is the future native override seam
+  - FreeBSD ports already model the relevant CPU-only packaging shape
 
 What is next:
 
 - freeze `PlanC` as the preferred layered strategy
-- design provider SPI work in parallel with waiting for upstream TCM source
-- make upstream TCM work on FreeBSD first once source lands
+- track upstream TCM PR #2061 until merge
+- make upstream TCM work on FreeBSD from the PR source first
+- design provider SPI work in parallel with PR review and the FreeBSD TCM port
+- consume the GCDX M15 pressure-provider bundle shape on the TBBX side
+- build a reserve-demand projection harness before modifying TCM internals
+- freeze the pressure snapshot field set now, but keep the delivery mechanism
+  provisional until the mixed-runtime baseline
+- measure TCM-off versus TCM-on/no-adapter mixed-runtime behavior before
+  building pressure integration
+- include GCD-only and oneTBB-only baselines before judging mixed-runtime
+  pressure behavior
 - keep `PlanA` as fallback if upstream TCM is delayed or unsuitable
 - keep `PlanB` as the contingency if the TCM seam later proves limiting
+- treat `ISPC` / `ISPCRT` as the first important downstream `TBBX` consumer
+  validation target
 
 ## Principles
 
@@ -57,6 +98,9 @@ What is next:
 - Do not make GCDX depend on TCM.
 - Do not let TCM vocabulary leak below the provider line.
 - No TCM headers or permit vocabulary inside GCDX / TWQ code.
+- Keep downstream consumer validation separate from native-tasking redesign.
+- Validate plain `TBBX` consumption before using downstream callback seams to
+  bypass `TBB`.
 
 ## Milestones
 
@@ -87,25 +131,25 @@ Exit criteria:
 - findings note, roadmap, and changelog are present
 - `PlanA`, `PlanB`, and `PlanC` are all documented with clear boundaries
 - the native `tbbx_permit_manager` and `PlanC` design notes exist
+- the `ISPC` / `ISPCRT` consumer strategy note exists
 
 ### M1: Upstream TCM Source Landing Assessment
 
-Status: next
+Status: in progress
 
 Goals:
 
-- monitor the oneTBB tree for the actual `thread_composability_manager/`
-  source landing
+- monitor oneTBB PR #2061 until it merges
 - inspect the real build system, source layout, and dependency surface
 - verify whether the real code matches the RFC-level expectations
 - identify any immediate FreeBSD blockers
-- set an explicit October 2026 reassessment checkpoint if source still has not
-  landed
+- identify whether provider injection can be upstreamed cleanly
 
 Exit criteria:
 
-- actual source is present and reviewed
+- PR source is reviewed against FreeBSD and GCDX needs
 - FreeBSD porting surface is understood well enough to estimate Phase C1
+- the provider-seam risk is documented from source, not inferred
 
 ### M2: Shared Provider SPI Freeze
 
@@ -114,11 +158,14 @@ Status: planned
 Goals:
 
 - design private topology/capacity/pressure provider SPIs below the runtime
-- validate those interfaces against existing GCDX machinery while waiting for
-  upstream TCM source
+- validate those interfaces against existing GCDX machinery while PR review and
+  FreeBSD port work proceed
 - keep pressure integration in `libthr` / `pthread_workqueue`, not GCD queue
   APIs
 - settle the event-plus-snapshot shape for future consumers
+- keep pressure snapshots platform-owned and distinguish current gauges from
+  cumulative event counters
+- keep backlog and pressure-state interpretation above the provider line
 
 Exit criteria:
 
@@ -157,23 +204,66 @@ Exit criteria:
 - standalone TCM path is stable enough to trust as a baseline
 - limitations are explicit rather than guessed
 
-### M5: PlanC Pressure Provider SPI Integration
+### M5: Mixed-Runtime Baseline Without Pressure Adapter
+
+Status: planned
+
+Goals:
+
+- measure GCD-only and oneTBB-only resource behavior first
+- run mixed GCD + oneTBB workloads before adding pressure integration
+- compare TCM disabled against TCM enabled with no pressure adapter
+- measure peak thread count, context switches, throughput, oneTBB arena
+  concurrency, and GCDX pressure samples
+- decide whether TCM alone is already useful or whether GCDX pressure is on
+  the critical path
+
+Exit criteria:
+
+- baseline data exists before the pressure adapter is built
+- pressure integration is classified as required or optional from measurement
+
+### M6: PlanC Pressure Adapter Integration
 
 Status: planned
 
 Goals:
 
 - expose TWQ / `pthread_workqueue` pressure upward through a private provider
-  SPI
-- let upstream/open TCM consume those facts without owning worker creation
+  SPI if M5 shows it is needed
+- let a FreeBSD TCM pressure adapter consume those facts without owning worker
+  creation
+- create a private synthetic reserve permit through the public TCM API to
+  represent external TWQ pressure
+- package the first adapter as a sidecar such as `libtbbx_twq_bridge.so`
+- use a separate TCM reserve client with a non-null no-op callback
+- request the reserve permit with `rigid_concurrency = 1`
+- consume `twq_pressure_provider_bundle_v1` above the provider line
+- size the initial reserve demand from `current_view.nonidle_workers_current`,
+  not from cumulative backlog counters
+- validate `TCM_ENABLE` and `tcmConnect` failure handling
+- use `tcmDeactivatePermit` when reserve demand drops to zero
+- call `tcmReleasePermit` before `tcmDisconnect` at sidecar shutdown
+- use explicit harness polling as the prototype trigger
+- measure raw reserve-demand behavior before adding smoothing
+- document polling-only trigger latency and add event-assisted pressure only if
+  measurements require it
 - measure whether kernel-informed pressure improves TCM grant quality
 
 Exit criteria:
 
 - GCDX remains fully independent underneath
-- mixed-runtime oversubscription is measurably reduced
+- pressure-adapter runs improve mixed-runtime behavior over the M5 TCM-only
+  baseline
+- no TCM source changes are required for v1
 
-### M6: PlanC Native Hybrid-Capacity Input
+Stop or defer M6 if the M5 no-TCM baseline already shows no meaningful
+oversubscription problem to solve.
+
+Stop or redesign M6 if the production trigger path cannot be implemented
+without making libthr, TWQ, or GCDX aware of TCM.
+
+### M7: PlanC Native Hybrid-Capacity Input
 
 Status: planned
 
@@ -189,7 +279,7 @@ Exit criteria:
 - TCM can consume stronger native hybrid facts on FreeBSD
 - policy remains layered and provider-driven
 
-### M7: PlanB Reassessment
+### M8: PlanB Reassessment
 
 Status: planned
 
@@ -198,14 +288,14 @@ Goals:
 - decide whether upstream/open TCM plus native platform inputs is sufficient
 - identify any concrete reasons to switch to the native `permit_manager` seam
 - only revive `PlanB` if PlanC shows real architectural limits
-- trigger this review early if upstream TCM source has still not landed by
-  October 2026
+- trigger this review early if upstream TCM has still not merged by October
+  2026
 
 Exit criteria:
 
 - the project has an explicit keep-PlanC or move-to-PlanB decision
 
-### M8: Broader TBBX Integration
+### M9: Broader TBBX Integration
 
 Status: planned
 
@@ -231,3 +321,7 @@ Specifically:
 3. design and validate the provider boundary in parallel with the upstream wait
 4. keep provider boundaries compatible with both PlanC and PlanB
 5. avoid premature PlanB implementation before upstream TCM is evaluated
+6. use `ISPC` / `ISPCRT` as the first external consumer target for plain
+   `TBBX` validation, separate from later callback-based native tasking work
+7. preserve ordinary downstream `find_package(TBB)` / `TBB::tbb` compatibility
+   so the `ISPCRT` consumer lane does not require custom patches
